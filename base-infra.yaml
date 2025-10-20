@@ -1,0 +1,16 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Base infra - EventBridge Bus + shared resources
+
+Resources:
+  # E-commerce Event Bus
+  EcomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: EcomEventBus
+      Description: An event bus for my e-commerce application that routes and receives events from different services.
+
+Outputs:
+  EventBusArn:
+    Value: !GetAtt EcomEventBus.Arn
+    Export:
+      Name: EcomEventBusArn
