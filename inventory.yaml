@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Inventory service - Lambda + SQS + DynamoDB + EventBridge + SNS integration
+
+Resources:
+  # DynamoDB table
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: InventoryTable
+
+      AttributeDefinitions:
+        - AttributeName: itemId
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: itemId
+          KeyType: HASH
+
+      BillingMode: PAY_PER_REQUEST
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS queue for inventory
+  InventoryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InventoryQueue
+      FifoQueue: false
+
+  # Inventory Lambda Role
+  InventoryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: inventory-lambda-role
+
+      Description: Allow inventory lambda to assume a role to interact with inventory table.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        # DynamoDb Permission
+        - PolicyName: InventoryDynamoAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt InventoryTable.Arn
+        # EventBridge Permission
+        - PolicyName: InventoryEventBridgeAccess
+          PolicyDocument:
+            Vesion: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: "*"
+
+  # CloudWatch log groups for lambda
+  InventoryServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/InventoryLambda
+      RetentionInDays: 14
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  # Lambda function
+  InventoryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: InventoryLambda
+      Runtime: python3.12
+      Description: Inventory lambda function that processes order placed routes from event bridge.
+      Handler: index.handler
+      Role: !GetAtt InventoryLambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          EVENT_BUS_NAME: EcomEventBus
+      Code:
+        ZipFile: |
+          import os, json, boto3, uuid
+
+          ddb = boto3.client('dynamodb')
+          eb = boto3.client('events')
+
+          ORDER_STATUS = 'pending'
+
+          def handler(event, context):
+            for record in event['Records']:
+              body = json.loads(record["body"])
+              order_id = body["orderId"]
+              item_id = body.get("itemId", "defaultItem")
+
+              resp = dynamo.get_item(
+                TableName="InventoryTable",
+                Key={"itemId": {"S": item_id}}
+              )
+              in_stock = "Item" in resp
+
+              if in_stock:
+                status = {"orderId": order_id, "stockConfirmed": True}
+              else:
+                  status = {"orderId": order_id, "stockConfirmed": False, "reason": "out_of_stock"}
+
+              eb.put_events(
+                Entries=[{
+                  "Source": "inventory.service",
+                  "DetailType": "StockConfirmation",
+                  "Detail": json.dumps(status)
+                }]
+              )
+
+            return {"statusCode": 200}
+      Timeout: 10
+
+  # Conncetion between Inventory sqs and lambda
+  InventoryEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt InventoryQueue.Arn
+      FunctionName: !Ref InventoryLambda
+      BatchSize: 1
+
+  # EventBridge Rule: forward OrderPlaced -> SQS
+  OrderPlacedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: OrderPlacedRule
+      Description: An event bridge rule to route OrderPlaced message to Inventory SQS.
+      EventPattern:
+        source:
+          - "orders.service"
+        detail-type:
+          - "OrderPlaced"
+      Targets:
+        - Id: InventoryQueueTarget
+          Arn: !GetAtt InventoryQueue.Arn
+
+  OrderPlacedRulePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InventoryQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt InventoryQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderPlacedRule.Arn
+
+  # SNS Topic
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: NotificationsTopic
+
+  # EventBridge Rule: forward all StockConfirmation to SNS
+  StockConfirmationToSNSTopic:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: StockConfirmationToSNS
+      EventPattern:
+        source:
+          - "inventory.service"
+        detail-type:
+          - "StockConfirmation"
+      Targets:
+        - Id: !Ref NotificationsTopic
+          Arn: SnsTarget
+
+Outputs:
+  InventoryTableName:
+    Value: !Ref InventoryTable
+  InventoryQueueName:
+    Value: !GetAtt InventoryQueue.QueueName
+  InventoryLambdaName:
+    Value: !GetAtt InventoryLambda
+  NotificationsTopicArn:
+    Value: !Ref NotificationsTopic

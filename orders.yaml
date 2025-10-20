@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Orders microservice - Lambda + DynamoDB + IAM + Log Group
+Description: Orders service - Lambda + DynamoDB + IAM + Log Group
 
 Resources:
   # DynamoDB table
@@ -9,11 +9,11 @@ Resources:
       TableName: OrdersTable
 
       AttributeDefinitions:
-        - AttributeName: orderID
+        - AttributeName: orderId
           AttributeType: S
 
       KeySchema:
-        - AttributeName: orderID
+        - AttributeName: orderId
           KeyType: HASH
 
       BillingMode: PAY_PER_REQUEST
@@ -27,7 +27,7 @@ Resources:
     Properties:
       RoleName: order-lambda-role-1
 
-      Description: Allow orders lambda to assume a role to interact with orders table.
+      Description: Allow order lambda to assume a role to interact with orders table.
 
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -51,11 +51,6 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:UpdateItem
                 Resource: !GetAtt OrdersTable.Arn
-              # EventBridge Permission
-              - Effect: Allow
-                Action:
-                  - events:PutEvents
-                Resource: !ImportValue EcomEventBusArn
           PolicyName: OrderTableAccess
 
   # CloudWatch log groups for lambda
@@ -90,70 +85,90 @@ Resources:
           ORDER_STATUS = 'pending'
 
           def handler(event, context):
-            try:
-              if 'body' not in event or not event['body']:
+            if "httpMethod" in event:
+              try:
+                if 'body' not in event or not event['body']:
+                  return {
+                    'statusCode': 400,
+                    'body': json.dumps({'message': 'Missing request body. Please send a JSON body with an "items" key, e.g., {"items": ["laptop", "mobile"]}'})
+                  }
+                
+                request_body = json.loads(event['body'])
+
+                order_items = request_body.get('items', [])
+
+                if not isinstance(order_items, list) or not order_items:
+                  return {
+                  'statusCode': 400,
+                  'body': json.dumps({'message': 'The "items" field must be a non-empty list of strings.'})
+                  }
+                
+                order_id = str(uuid.uuid4())
+
+                ddb.put_item(
+                  TableName=os.environ['TABLE_NAME'],
+                  Item={
+                    'orderId': {'S': order_id},
+                    'status': {'S': ORDER_STATUS},
+                    'items': {
+                      'L': [{'S': item} for item in order_items]
+                    }
+                  }
+                )
+
+                event_payload = {
+                  'orderId': order_id,
+                  'items': order_items,
+                  'status': ORDER_STATUS
+                }
+
+                eb.put_events(
+                  Entries=[
+                    {
+                      'Source': 'orders.service',
+                      'DetailType': 'OrderPlaced',
+                      'Detail': json.dumps(event_payload),
+                      'EventBusName': os.environ['EVENT_BUS_NAME']
+                    }
+                  ]  
+                )
+
+                return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Order Placed', 'orderId': order_id, 'items': order_items})
+                }
+              
+              except json.JSONDecodeError:
                 return {
                   'statusCode': 400,
-                  'body': json.dumps({'message': 'Missing request body. Please send a JSON body with an "items" key, e.g., {"items": ["laptop", "mobile"]}'})
+                  'body': json.dumps({'message': 'Invalid JSON format in request body.'})
                 }
               
-              request_body = json.loads(event['body'])
-
-              order_items = request_body.get('items', [])
-
-              if not isinstance(order_items, list) or not order_items:
+              except Exception as e:
+                print(f"Error processing request: {e}")
                 return {
-                'statusCode': 400,
-                'body': json.dumps({'message': 'The "items" field must be a non-empty list of strings.'})
-                }
+                  'statusCode': 500,
+                  'body': json.dumps({'message': f'Internal Server Error: {str(e)}'})
+              }
+            
+            if "detail-type" in event and event["detail-type"] == "StockConfirmation":
+              detail = event["detail"]
+              order_id = detail["orderId"]
+
+              if not detail.get("StockConfirmed", True):
+                table.update_item(
+                  Key={"orderId": order_id}
+                  UpdateExpression="SET #s = :status, reason = :reason",
+                  ExpressionAttributeNames={"#s": "status"},
+                  ExpressionAttributeValues={
+                    ":status": "cancelled",
+                    ":reason": "out_of_stock"
+                  }
+                )
               
-              order_id = str(uuid.uuid4())
-
-              ddb.put_item(
-                TableName=os.environ['TABLE_NAME'],
-                Item={
-                  'orderId': {'S': order_id},
-                  'status': {'S': ORDER_STATUS},
-                  'items': {
-                    'L': [{'S': item} for item in order_items]
-                  }
-                }
-              )
-
-              event_payload = {
-                'orderId': order_id,
-                'items': order_items,
-                'status': ORDER_STATUS
-              }
-
-              eb.put_events(
-                Entries=[
-                  {
-                    'Source': 'orders.service',
-                    'DetailType': 'OrderPlaced',
-                    'Detail': json.dumps(event_payload),
-                    'EventBusName': os.environ['EVENT_BUS_NAME']
-                  }
-                ]  
-              )
-
-              return {
-                'statusCode': 200,
-                'body': json.dumps({'message': 'Order Placed', 'orderId': order_id, 'items': order_items})
-              }
+              return {"statusCode": 200}
             
-            except json.JSONDecodeError:
-              return {
-                'statusCode': 400,
-                'body': json.dumps({'message': 'Invalid JSON format in request body.'})
-              }
-            
-            except Exception as e:
-              print(f"Error processing request: {e}")
-              return {
-                'statusCode': 500,
-                'body': json.dumps({'message': f'Internal Server Error: {str(e)}'})
-            }
+            return {"statusCode": 400, "body": "Unknown event source"}
       Timeout: 10
 
   # Orders API Gateway
@@ -209,6 +224,32 @@ Resources:
     Properties:
       RestApiId: !Ref OrdersApi
       StageName: prod
+  
+  # EventBridge Rule: Capture StockConfirmation=False
+  InventoryFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InventoryFailureRule
+      EventPattern:
+        source:
+          - inventory.service
+        detail-type:
+          - "StockConfirmation"
+        detail:
+          stockConfirmed:
+            - false
+      Targets:
+        - Id: OrdersLambdaTarget
+          Arn: !GetAtt OrderLambda.Arn
+  
+  # Permission to invoke event bridge by lambda
+  LambdaInvokePermissionEventBridge:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InvenotryFailureRule.Arn
 
 Outputs:
   OrdersApiEndpoint:
