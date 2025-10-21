@@ -83,6 +83,10 @@ Resources:
       Code:
         ZipFile: |
           import os, json, boto3, uuid
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           ddb = boto3.client('dynamodb')
           eb = boto3.client('events')
@@ -122,6 +126,8 @@ Resources:
                   }
                 )
 
+                logger.info(f"Order {order_id} successfully placed in table.")
+
                 event_payload = {
                   'orderId': order_id,
                   'items': order_items,
@@ -138,6 +144,8 @@ Resources:
                     }
                   ]  
                 )
+
+                logger.info(f"OrderPlaced event published for order {order_id} to bus: {os.environ['EVENT_BUS_NAME']}")
 
                 return {
                   'statusCode': 200,
@@ -161,6 +169,8 @@ Resources:
               detail = event["detail"]
               order_id = detail["orderId"]
 
+              table = ddb_resource.Table(os.environ['TABLE_NAME'])
+
               if not detail.get("stockConfirmed", True):
                 table.update_item(
                   Key={"orderId": order_id},
@@ -171,6 +181,8 @@ Resources:
                     ":reason": "out_of_stock"
                   }
                 )
+
+                logger.info(f"Order {order_id} successfully updated in table called via EventBridge.")
               
               return {"statusCode": 200}
             
@@ -252,6 +264,8 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: InventoryFailureRule
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route stock status message to Order lambda.
       EventPattern:
         source:
           - inventory.service

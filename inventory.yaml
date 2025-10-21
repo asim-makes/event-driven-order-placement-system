@@ -26,7 +26,7 @@ Resources:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: InventoryQueue
-      FifoQueue: false
+      MessageRetentionPeriod: 1209600
 
   # Inventory Lambda Role
   InventoryLambdaRole:
@@ -46,6 +46,7 @@ Resources:
 
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
 
       Policies:
         # DynamoDb Permission
@@ -56,16 +57,14 @@ Resources:
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
                 Resource: !GetAtt InventoryTable.Arn
-        # EventBridge Permission
-        - PolicyName: InventoryEventBridgeAccess
-          PolicyDocument:
-            Vesion: "2012-10-17"
-            Statement:
+              # EventBridge Permission
               - Effect: Allow
                 Action:
                   - events:PutEvents
-                Resource: "*"
+                Resource: !ImportValue EcomEventBusArn
 
   # CloudWatch log groups for lambda
   InventoryServiceLogGroup:
@@ -81,17 +80,21 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: InventoryLambda
-      Runtime: python3.12
+      Runtime: python3.11
       Description: Inventory lambda function that processes order placed routes from event bridge.
       Handler: index.handler
       Role: !GetAtt InventoryLambdaRole.Arn
       Environment:
         Variables:
-          TABLE_NAME: !Ref OrdersTable
+          TABLE_NAME: !Ref InventoryTable
           EVENT_BUS_NAME: EcomEventBus
       Code:
         ZipFile: |
           import os, json, boto3, uuid
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
           ddb = boto3.client('dynamodb')
           eb = boto3.client('events')
@@ -100,28 +103,40 @@ Resources:
 
           def handler(event, context):
             for record in event['Records']:
-              body = json.loads(record["body"])
-              order_id = body["orderId"]
-              item_id = body.get("itemId", "defaultItem")
+              eventbridge_event = json.loads(record["body"])
+              detail = eventbridge_event["detail"]
 
-              resp = dynamo.get_item(
-                TableName="InventoryTable",
-                Key={"itemId": {"S": item_id}}
-              )
-              in_stock = "Item" in resp
+              order_id = detail["orderId"]
+              order_items = detail["items"]
 
-              if in_stock:
-                status = {"orderId": order_id, "stockConfirmed": True}
-              else:
-                  status = {"orderId": order_id, "stockConfirmed": False, "reason": "out_of_stock"}
+              inventory_table_name = os.environ['TABLE_NAME']
+
+              for item_id in order_items:
+                resp = ddb.get_item(
+                  TableName=inventory_table_name, 
+                  Key={"itemId": {"S": item_id}}
+                )
+
+                if "Item" not in resp:
+                  stock_confirmed = False
+                  break
+              
+              status = {"orderId": order_id, "stockConfirmed": stock_confirmed}
+
+              if not stock_confirmed:
+                status["reason"] = "out_of_stock"
 
               eb.put_events(
-                Entries=[{
-                  "Source": "inventory.service",
-                  "DetailType": "StockConfirmation",
-                  "Detail": json.dumps(status)
-                }]
-              )
+              Entries=[{
+                "Source": "inventory.service",
+                "DetailType": "StockConfirmation",
+                "Detail": json.dumps(status),
+                "EventBusName": os.environ['EVENT_BUS_NAME']
+              }]
+
+              logger.info(f"StockConfirmation event published to bus: {os.environ['EVENT_BUS_NAME']}")
+
+            )
 
             return {"statusCode": 200}
       Timeout: 10
@@ -139,6 +154,7 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: OrderPlacedRule
+      EventBusName: !ImportValue EcomEventBusArn
       Description: An event bridge rule to route OrderPlaced message to Inventory SQS.
       EventPattern:
         source:
@@ -176,14 +192,16 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: StockConfirmationToSNS
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route stock status message to SNS.
       EventPattern:
         source:
           - "inventory.service"
         detail-type:
           - "StockConfirmation"
       Targets:
-        - Id: !Ref NotificationsTopic
-          Arn: SnsTarget
+        - Id: SnsTarget
+          Arn: !Ref NotificationsTopic
 
 Outputs:
   InventoryTableName:
@@ -191,6 +209,6 @@ Outputs:
   InventoryQueueName:
     Value: !GetAtt InventoryQueue.QueueName
   InventoryLambdaName:
-    Value: !GetAtt InventoryLambda
+    Value: !Ref InventoryLambda
   NotificationsTopicArn:
     Value: !Ref NotificationsTopic
