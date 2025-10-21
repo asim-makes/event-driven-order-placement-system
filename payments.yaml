@@ -49,11 +49,11 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
 
       Policies:
-      # DynamoDb Permission
       - PolicyName: PaymentEBDynamoAccess
         PolicyDocument:
           Version: "2012-10-17"
           Statement:
+            # DynamoDb Permission
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
@@ -151,6 +151,24 @@ Resources:
                     }
                   )
                   logger.info(f"Payment success for order {order_id}. Payments table updated.")
+
+                  payment_confirmation_event = {
+                    "orderId": order_id, 
+                    "paymentConfirmed": True,
+                    "reason": reason,
+                    "orderItems": order_items
+                  }
+                  
+                  eb.put_events(
+                    Entries=[{
+                      "Source": "payment.service",
+                      "DetailType": "PaymentConfirmation",
+                      "Detail": json.dumps(payment_confirmation_event),
+                      "EventBusName": os.environ['EVENT_BUS_NAME']
+                    }]
+                  )
+                  logger.info(f"PaymentConfirmation: True event published for order {order_id}.")
+
                 else:
                   status = "failed"
                   reason = "insufficient_funds"

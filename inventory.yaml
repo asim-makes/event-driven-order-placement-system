@@ -115,7 +115,7 @@ Resources:
                 detail = eventbridge_event.get("detail", {})
                 detail_type = eventbridge_event.get("detail-type")
 
-                if detail_type == "PaymentConfirmation":
+                if detail_type == "PaymentConfirmation" and event.get('detail', {}).get('paymentConfirmed') == False:
                   operation = "COMPENSATION"
                 elif detail_type == "OrderPlaced":
                   operation = "DECREMENT" 

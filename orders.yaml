@@ -187,15 +187,49 @@ Resources:
                   }
                   logger.info(f"Order {order_id} status updated to payment_failed.")
               
+              elif event["detail-type"] == "ShipmentCreated":
+                shipping_status = detail.get("shippingStatus", "on_delivery")
+                tracking_number = detail.get("trackingNumber")
+                
+                update_data = {
+                  "status": shipping_status, 
+                  "trackingNumber": tracking_number
+                }
+
+                logger.info(f"Order {order_id} status updated to {shipping_status} by shipping service.")
+
+              elif event["detail-type"] == "ShipmentCreatedByDLQ":
+                shipping_status = detail.get("shippingStatus", "on_delivery")
+                tracking_number = detail.get("trackingNumber")
+                processed_by = detail.get("processedBy")
+                additional_info = detail.get("additionalInfo")
+                
+                update_data = {
+                  "status": shipping_status, 
+                  "trackingNumber": tracking_number,
+                  "processedBy": processed_by,
+                  "additionalInfo": additional_info
+                }
+
+                logger.info(f"Order {order_id} status updated to {shipping_status} by shipping service DLQ.")
+              
               if update_data:
+                update_expression_parts = []
+                expression_attribute_names = {}
+                expression_attribute_values = {}
+                
+                for key, value in update_data.items():
+                  alias = f"#{key}"
+                  value_alias = f":{key}"
+                  update_expression_parts.append(f"{alias} = {value_alias}")
+                  expression_attribute_names[alias] = key
+                  expression_attribute_values[value_alias] = value
+                
                 table.update_item(
                   Key={"orderId": order_id},
-                  UpdateExpression="SET #s = :status, #r = :reason",
-                  ExpressionAttributeNames={"#s": "status", "#r": "reason"},
-                  ExpressionAttributeValues={
-                    ":status": update_data["status"],
-                    ":reason": update_data["reason"]
-                  }
+                  UpdateExpression="SET " + ", ".join(update_expression_parts),
+                  ExpressionAttributeNames=expression_attribute_names,
+                  ExpressionAttributeValues=expression_attribute_values
                 )
 
               return {"statusCode": 200}
@@ -310,6 +344,38 @@ Resources:
       Targets:
         - Id: OrdersLambdaTargetForPayment
           Arn: !GetAtt OrderLambda.Arn
+
+  # EventBridge Rule: Capture ShipmentCreated
+  ShipmentCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ShipmentCreatedRule
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route shipment status message to Order lambda
+      EventPattern:
+        source:
+          - shipping.service
+        detail-type:
+          - "ShipmentCreated"
+      Targets:
+        - Id: ShipmentLambdaTarget
+          Arn: !GetAtt OrderLambda.Arn
+
+  # EventBridge Rule: Capture ShipmentCreated by DLQ
+  ShipmentCreatedRuleDLQ:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ShipmentCreatedRuleDLQ
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route shipment status message sent by DLQ to Order lambda
+      EventPattern:
+        source:
+          - shipping.service
+        detail-type:
+          - "ShipmentCreatedByDLQ"
+      Targets:
+        - Id: ShipmentLambdaTargetDLQ
+          Arn: !GetAtt OrderLambda.Arn
   
   # Permissions to invoke lambda by event bridge
   LambdaInvokePermissionEventBridgeForInventory:
@@ -327,6 +393,22 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt PaymentFailureRule.Arn
+
+  LambdaInvokePermissionEventBridgeForShipment:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ShipmentCreatedRule.Arn
+
+  LambdaInvokePermissionEventBridgeForShipmentDLQ:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ShipmentCreatedRuleDLQ.Arn
 
 Outputs:
   OrdersApiEndpoint:

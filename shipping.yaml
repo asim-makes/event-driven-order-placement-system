@@ -1,0 +1,441 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Shipping Service Stack
+  - Routes PaymentConfirmation (success) -> ShippingQueue
+  - ShippingQueue -> ShippingLambda (creates shipping record, publishes SNS)
+  - DLQ with alarm + ops SNS + DLQ processor to reprocess messages
+
+Resources:
+  # SNS Topic for Shipping
+  ShippingNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ShippingNotifications
+
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OpsAlertNotifications
+
+  # DynamoDB Table
+  ShippingTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+      TableName: ShippingTable
+
+      AttributeDefinitions:
+        - AttributeName: shippingId
+          AttributeType: S
+
+      KeySchema:
+      - AttributeName: shippingId
+        KeyType: HASH
+
+      BillingMode: PAY_PER_REQUEST
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS Queue: Main Queue and DLQ
+  ShippingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ShippingDLQ
+
+  ShippingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ShippingQueue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ShippingDLQ.Arn
+        maxReceiveCount: 3
+
+  # IAM role for Shipping Lambda
+  ShippingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: shipping-lambda-role
+
+      Description: Allow shipping lambda to assume a role to interact with cloudwatch, sqs, sns, eventbridge.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+      Policies:
+      - PolicyName: ShippingAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            # DynamoDb Permission
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ShippingTable.Arn
+            # EventBridge Permission
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !ImportValue EcomEventBusArn
+            # SNS permission
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource:
+                - !Ref ShippingNotificationTopic
+                - !Ref OpsAlertTopic
+
+  # CloudWatch log groups for lambda
+  ShipmentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ShippingLambda
+      RetentionInDays: 14
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  ShippingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ShippingLambda
+      Runtime: python3.11
+      Description: Shipping lambda function that processes confirmed order routes from event bridge.
+      Handler: index.handler
+      Role: !GetAtt ShippingLambdaRole.Arn
+      Environment:
+        Variables:
+          SHIPPING_TABLE_NAME: !Ref ShippingTable
+          SHIPPING_TOPIC_ARN: !Ref ShippingNotificationTopic
+          EVENT_BUS_NAME: EcomEventBus
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3, random, time, logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ddb = boto3.resource('dynamodb')
+          eb = boto3.client('events')
+          sns = boto3.client('sns')
+
+          SHIPPING_TABLE = os.environ['SHIPPING_TABLE_NAME']
+          TOPIC_ARN = os.environ['SHIPPING_TOPIC_ARN']
+          EVENT_BUS_NAME = os.environ['EVENT_BUS_NAME']
+
+          shipping_table = ddb.Table(SHIPPING_TABLE)
+
+          # simulate external API call with a 20% chance of failure
+          def external_shipping_api_sim(order_id):
+            time.sleep(0.5)
+            if random.random() < 0.20:
+              raise Exception("External shipping API timed out")
+            return {
+              "carrier": "FastShip",
+              "trackingNumber": str(uuid.uuid4())[:8],
+              "estimatedDeliveryDays": 5
+            }
+
+          def handler(event, context):
+            for record in event.get('Records', []):
+              body = record.get('body')
+              try:
+                payload = json.loads(body)
+              except Exception:
+                payload = body if isinstance(body, dict) else json.loads(body or '{}')
+
+              detail = payload.get('detail') if isinstance(payload, dict) and 'detail' in payload else payload
+              order_id = detail.get('orderId')
+
+              if not order_id:
+                continue
+
+              shipping_id = str(uuid.uuid4())
+              try:
+                api_resp = external_shipping_api_sim(order_id)
+
+                shipping_item = {
+                  "shippingId": shipping_id,
+                  "orderId": order_id,
+                  "carrier": api_resp["carrier"],
+                  "trackingNumber": api_resp["trackingNumber"],
+                  "status": "on_delivery",
+                  "createdAt": str(int(time.time())),
+                  "estimatedDeliveryDays": api_resp["estimatedDeliveryDays"]
+                }
+
+                shipping_table.put_item(Item=shipping_item)
+
+                logger.info(f"Shipping for order {order_id} created: {shipping_item}")
+
+                sns.publish(
+                  TopicArn=TOPIC_ARN,
+                  Message=json.dumps({"default": json.dumps({"message": "Your shipment is on the way", "orderId": order_id, "shippingId": shipping_id})}),
+                  MessageStructure='json'
+                )
+
+                logger.info(f"Notification sent for order {order_id}")
+
+                shipping_confirmation_event = {
+                  "orderId": order_id,
+                  "shippingId": shipping_id,
+                  "shippingStatus": "SHIPPED", # Use a clearer, distinct status for the Order table
+                  "trackingNumber": api_resp["trackingNumber"]
+                }
+                
+                eb.put_events(
+                    Entries=[{
+                      'Source': 'shipping.service',
+                      'DetailType': 'ShipmentCreated',
+                      'Detail': json.dumps(shipping_confirmation_event),
+                      'EventBusName': EVENT_BUS_NAME
+                    }]
+                )
+
+                logger.info(f"ShipmentCreated event sent for order {order_id} in EvenBus")
+
+              except Exception as e:
+                # Re-raise to fail the Lambda invocation: SQS -> Lambda will retry until maxReceiveCount triggers DLQ
+                print(f"Shipping for order {order_id} failed: {str(e)}")
+                raise
+
+              return {"statusCode": 200}
+
+  # EventBridge to SQS rule
+  PaymentConfirmedToShippingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentConfirmedToShipping
+      EventBusName: !ImportValue EcomEventBusArn
+      EventPattern:
+        source:
+          - payment.service
+        detail-type:
+          - "PaymentConfirmation"
+        detail:
+          paymentConfirmed:
+            - true
+      Targets:
+        - Arn: !GetAtt ShippingQueue.Arn
+          Id: ShippingQueueTarget
+
+  # EventBridge Permission to send to SQS
+  PaymentToShippingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ShippingQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:sendMessage
+            Resource: !GetAtt ShippingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt PaymentConfirmedToShippingRule.Arn
+
+  # Event source mapping: SQS -> Shipping Lambda
+  ShippingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ShippingQueue.Arn
+      FunctionName: !Ref ShippingLambda
+      BatchSize: 1
+      Enabled: true
+
+  # DLQ Processor Lambda Role
+  DLQProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dlq-processor-role
+
+      Description: Allow dlq processor to assume a role to interact with cloudwatch, sqs, sns, eventbridge.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+      Policies:
+      - PolicyName: DLQDynaoSnsAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            # DynamoDb Permission
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ShippingTable.Arn
+            # EventBridge Permission
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !ImportValue EcomEventBusArn
+            # SNS permission
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource:
+                - !Ref ShippingNotificationTopic
+                - !Ref OpsAlertTopic
+
+  # CloudWatch log groups for lambda
+  DLQServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/DLQProcessorLambda
+      RetentionInDays: 14
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  DLQProcessorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DLQProcessorLambda
+      Runtime: python3.11
+      Description: DLQ lambda function that processes confirmed order routes from event bridge.
+      Handler: index.handler
+      Role: !GetAtt DLQProcessorRole.Arn
+      Environment:
+        Variables:
+          SHIPPING_TABLE_NAME: !Ref ShippingTable
+          SHIPPING_TOPIC_ARN: !Ref ShippingNotificationTopic
+          EVENT_BUS_NAME: EcomEventBus
+      Code:
+        ZipFile: |
+          import json, os, boto3, uuid, time, logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ddb = boto3.resource('dynamodb')
+          eb = boto3.client('events')
+          sns = boto3.client('sns')
+
+          shipping_table = ddb.Table(os.environ['SHIPPING_TABLE_NAME'])
+          event_bus_name = os.environ['EVENT_BUS_NAME']
+          topic = os.environ['SHIPPING_TOPIC_ARN']
+
+          def handler(event, context):
+            for record in event.get('Records', []):
+              try:
+                body = json.loads(record.get('body') or '{}')
+                detail = body.get('detail') if isinstance(body, dict) and 'detail' in body else body
+                order_id = detail.get('orderId')
+
+                if not order_id:
+                  continue
+
+                shipping_id = str(uuid.uuid4())
+                tracking_number = str(uuid.uuid4())[:8]
+
+                shipping_item = {
+                  "shippingId": shipping_id,
+                  "orderId": order_id,
+                  "carrier": "ReprocessedCarrier",
+                  "trackingNumber": tracking_number,
+                  "status": "on_delivery",
+                  "createdAt": str(int(time.time())),
+                  "estimatedDeliveryDays": 7
+                }
+                shipping_table.put_item(Item=shipping_item)
+
+                notification_content = {
+                  "message": "Your shipment has been reprocessed and is on delivery",
+                  "orderId": order_id,
+                  "shippingId": shipping_id
+                }
+
+                sns.publish(
+                  TopicArn=topic,
+                  Message=json.dumps({"default": json.dumps(notification_content)}),
+                  MessageStructure='json'
+                )
+
+                shipping_confirmation_event = {
+                  "orderId": order_id,
+                  "shippingId": shipping_id,
+                  "shippingStatus": "SHIPPED", # Use a clearer, distinct status for the Order table,
+                  "processedBy": "DLQ",
+                  "trackingNumber": tracking_number,
+                  "additionalInfo": "A new tracking number was created because the original item failed to ship."
+                }
+              
+                eb.put_events(
+                  Entries=[{
+                    'Source': 'shipping.service',
+                    'DetailType': 'ShipmentCreatedByDLQ',
+                    'Detail': json.dumps(shipping_confirmation_event),
+                    'EventBusName': event_bus_name
+                  }]
+                )
+
+              except Exception as e:
+                print("DLQ processor failed for record:", str(e))
+
+            return {"statusCode": 200}
+
+  # Event Source Mapping for DLQ -> DLQ Lambda
+  DLQProcessorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref DLQProcessorLambda
+      EventSourceArn: !GetAtt ShippingDLQ.Arn
+      BatchSize: 1
+      Enabled: True
+
+  # CloudWatch Alarm: DLQ > 0
+  ShippingDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: ShippingDLQAlarm
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ShippingDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref OpsAlertTopic
+      OKActions:
+        - !Ref OpsAlertTopic
+
+Outputs:
+  ShippingQueueUrl:
+    Value: !Ref ShippingQueue
+  ShippingDLQUrl:
+    Value: !Ref ShippingDLQ
+  ShippingTableName:
+    Value: !Ref ShippingTable
+  ShippingLambdaName:
+    Value: !Ref ShippingLambda
+  ShippingNotificationTopicArn:
+    Value: !Ref ShippingNotificationTopic
+  OpsAlertTopicArn:
+    Value: !Ref OpsAlertTopic
