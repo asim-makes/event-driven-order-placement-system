@@ -82,56 +82,60 @@ Resources:
           EVENT_BUS_NAME: EcomEventBus
       Code:
         ZipFile: |
-          import os, json, boto3, uuid
-          import logging
+          import os, json, boto3, uuid, logging
+          from decimal import Decimal
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
-          ddb = boto3.client('dynamodb')
           eb = boto3.client('events')
           ddb_resource = boto3.resource('dynamodb')
 
-          ORDER_STATUS = 'pending'
+          ORDER_STATUS = ['pending', 'cancelled', 'payment_failed']
+
+          def format_response(status_code, body):
+            return {
+              'statusCode': status_code,
+              'body': json.dumps(body)
+            }
 
           def handler(event, context):
             if "httpMethod" in event:
               try:
                 if 'body' not in event or not event['body']:
-                  return {
-                    'statusCode': 400,
-                    'body': json.dumps({'message': 'Missing request body. Please send a JSON body with an "items" key, e.g., {"items": ["laptop", "mobile"]}'})
-                  }
+                  return format_response(400, {'message': 'Missing request body. Please send a JSON body with "items" and "amount".'})
                 
                 request_body = json.loads(event['body'])
-
                 order_items = request_body.get('items', [])
+                order_amount_raw = request_body.get('amount')
 
                 if not isinstance(order_items, list) or not order_items:
-                  return {
-                  'statusCode': 400,
-                  'body': json.dumps({'message': 'The "items" field must be a non-empty list of strings.'})
-                  }
+                  return format_response(400, {'message': 'The "items" field must be a non-empty list of strings.'})
+                
+                try:
+                  order_amount = Decimal(str(order_amount_raw)) 
+                except Exception:
+                  return format_response(400, {'message': 'The "amount" field must be a valid number.'})
                 
                 order_id = str(uuid.uuid4())
+                table = ddb_resource.Table(os.environ['TABLE_NAME'])
 
-                ddb.put_item(
-                  TableName=os.environ['TABLE_NAME'],
+                table.put_item(
                   Item={
-                    'orderId': {'S': order_id},
-                    'status': {'S': ORDER_STATUS},
-                    'items': {
-                      'L': [{'S': item} for item in order_items]
-                    }
+                    'orderId': order_id, 
+                    'status': ORDER_STATUS[0],
+                    'amount': order_amount,
+                    'items': order_items
                   }
                 )
 
-                logger.info(f"Order {order_id} successfully placed in table.")
+                logger.info(f"Order {order_id} with amount: {order_amount} successfully placed in table.")
 
                 event_payload = {
                   'orderId': order_id,
-                  'items': order_items,
-                  'status': ORDER_STATUS
+                  'orderItems': order_items,
+                  'amount': float(order_amount),
+                  'status': ORDER_STATUS[0]
                 }
 
                 eb.put_events(
@@ -145,45 +149,55 @@ Resources:
                   ]  
                 )
 
-                logger.info(f"OrderPlaced event published for order {order_id} to bus: {os.environ['EVENT_BUS_NAME']}")
+                logger.info(f"OrderPlaced event published for order {order_id}.")
 
-                return {
-                  'statusCode': 200,
-                  'body': json.dumps({'message': 'Order Placed', 'orderId': order_id, 'items': order_items})
-                }
-              
+                return format_response(200, {'message': 'Order Placed', 'orderId': order_id, 'items': order_items, 'amount': float(order_amount)})
+
               except json.JSONDecodeError:
-                return {
-                  'statusCode': 400,
-                  'body': json.dumps({'message': 'Invalid JSON format in request body.'})
-                }
+                return format_response(400, {'message': 'Invalid JSON format in request body.'})
               
               except Exception as e:
-                print(f"Error processing request: {e}")
-                return {
-                  'statusCode': 500,
-                  'body': json.dumps({'message': f'Internal Server Error: {str(e)}'})
-              }
+                logger.error(f"Error processing HTTP request: {e}", exc_info=True)
+                return format_response(500, {'message': f'Internal Server Error: {str(e)}'})
             
-            if "detail-type" in event and event["detail-type"] == "StockConfirmation":
-              detail = event["detail"]
-              order_id = detail["orderId"]
-
+            elif "detail-type" in event:
               table = ddb_resource.Table(os.environ['TABLE_NAME'])
+              detail = event.get("detail", {})
+              order_id = detail.get("orderId")
 
-              if not detail.get("stockConfirmed", True):
+              if not order_id:
+                logger.warning("Received EventBridge event without an orderId. Skipping.")
+                return {"statusCode": 200}
+              
+              update_data = None
+
+              if event["detail-type"] == "StockConfirmation":
+                if not detail.get("stockConfirmed", True):
+                  update_data = {
+                    "status": ORDER_STATUS[1],
+                    "reason": "out_of_stock"
+                  }
+                  logger.info(f"Order {order_id} status updated to cancelled (out of stock).")
+
+              elif event["detail-type"] == "PaymentConfirmation":
+                if not detail.get("paymentConfirmed", True):
+                  update_data = {
+                    "status": ORDER_STATUS[2],
+                    "reason": "insufficient_funds"
+                  }
+                  logger.info(f"Order {order_id} status updated to payment_failed.")
+              
+              if update_data:
                 table.update_item(
                   Key={"orderId": order_id},
                   UpdateExpression="SET #s = :status, #r = :reason",
                   ExpressionAttributeNames={"#s": "status", "#r": "reason"},
                   ExpressionAttributeValues={
-                    ":status": "cancelled",
-                    ":reason": "out_of_stock"
+                    ":status": update_data["status"],
+                    ":reason": update_data["reason"]
                   }
                 )
 
-                logger.info(f"Order {order_id} successfully updated in table called via EventBridge.")
-              
               return {"statusCode": 200}
             
             return {"statusCode": 400, "body": "Unknown event source"}
@@ -260,12 +274,12 @@ Resources:
             RestApi: !Ref OrdersApi
   
   # EventBridge Rule: Capture StockConfirmation=False
-  InventoryFailureRule:
+  StockConfirmationFalseRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: InventoryFailureRule
+      Name: StockConfirmationFalseRule
       EventBusName: !ImportValue EcomEventBusArn
-      Description: An event bridge rule to route stock status message to Order lambda.
+      Description: An event bridge rule to route stock status (False) message to Order lambda.
       EventPattern:
         source:
           - inventory.service
@@ -275,17 +289,44 @@ Resources:
           stockConfirmed:
             - false
       Targets:
-        - Id: OrdersLambdaTarget
+        - Id: OrdersLambdaTargetForInventory
+          Arn: !GetAtt OrderLambda.Arn
+    
+  # EventBridge Rule: Capture PaymentConfirmation=False
+  PaymentFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentFailureRule
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route payment status message to Order lambda
+      EventPattern:
+        source:
+          - payment.service
+        detail-type:
+          - "PaymentConfirmation"
+        detail:
+          paymentConfirmed:
+            - false
+      Targets:
+        - Id: OrdersLambdaTargetForPayment
           Arn: !GetAtt OrderLambda.Arn
   
-  # Permission to invoke event bridge by lambda
-  LambdaInvokePermissionEventBridge:
+  # Permissions to invoke lambda by event bridge
+  LambdaInvokePermissionEventBridgeForInventory:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref OrderLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt InventoryFailureRule.Arn
+      SourceArn: !GetAtt StockConfirmationFalseRule.Arn
+
+  LambdaInvokePermissionEventBridgeForPayment:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrderLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PaymentFailureRule.Arn
 
 Outputs:
   OrdersApiEndpoint:

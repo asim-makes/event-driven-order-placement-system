@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Payment Service - Lambda + SQS + DynamoDB + EventBridge + SNS integration
+
+Resources:
+  # DynamoDB Table
+  PaymentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: PaymentTable
+
+      AttributeDefinitions:
+        - AttributeName: paymentId
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: paymentId
+          KeyType: HASH
+
+      BillingMode: PAY_PER_REQUEST
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS queue for payment
+  PaymentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: PaymentQueue
+      MessageRetentionPeriod: 1209600
+
+  # Payment Lambda role
+  PaymentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: payment-lambda-role
+
+      Description: Allow payment lambda to assume a role to interact with cloudwatch, sqs, eventbridge and inventory table.
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+      Policies:
+      # DynamoDb Permission
+      - PolicyName: PaymentEBDynamoAccess
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt PaymentTable.Arn
+            # EventBridge Permission
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !ImportValue EcomEventBusArn
+
+  # CloudWatch log groups for lambda
+  PaymentServiceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/PaymentLambda
+      RetentionInDays: 14
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  # Lambda Function
+  PaymentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PaymentLambda
+      Runtime: python3.11
+      Description: Payment lambda function that processes confirmed order routes from event bridge.
+      Handler: index.handler
+      Role: !GetAtt PaymentLambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PaymentTable
+          EVENT_BUS_NAME: EcomEventBus
+          # FORCE_FAIL: true Uncomment this line for testing
+      Code:
+        ZipFile: |
+          import os, json, boto3, uuid, logging, random
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ddb = boto3.client('dynamodb')
+          eb = boto3.client('events')
+
+          def handler(event, context):
+            for record in event['Records']:
+              try:
+                eventbridge_event = json.loads(record["body"])
+                detail = eventbridge_event.get("detail", {})
+
+                order_id = detail.get("orderId")
+                amount_raw = detail.get("amount") 
+                order_items = detail.get("orderItems", [])
+
+                logger.info(f"Order items: {order_items}")
+
+                if not order_id or amount_raw is None:
+                  logger.error(f"Missing crucial detail (orderId or amount): {detail}. Skipping record.")
+                  continue
+                
+                amount = Decimal(str(amount_raw))
+                payment_id = str(uuid.uuid4())
+                payments_table_name = os.environ["TABLE_NAME"]
+
+                ## Mock payment
+                # Uncomment these lines for testing failure
+                # FORCE_FAIL = os.environ.get('FORCE_FAIL', 'False').lower() == 'true'
+
+                # if FORCE_FAIL:
+                #   success = False
+                #   logger.warning(f"Payment failure is FORCED for order {order_id}.")
+                # else:
+                #   if random.random() < 0.75:
+                #     success = True
+                #   else:
+                #     success = False
+                
+                success = random.choice([True, True, True, False])
+
+                if success:
+                  status = "success"
+                  reason = "Payment processed successfully."
+                  
+                  ddb.put_item(
+                    TableName=payments_table_name,
+                    Item={
+                      "paymentId": {"S": payment_id},
+                      "orderId": {"S": order_id},
+                      "paymentConfirmed": {"S": status},
+                      "amount": {"N": str(amount)},
+                      "reason": {"S": reason}
+                    }
+                  )
+                  logger.info(f"Payment success for order {order_id}. Payments table updated.")
+                else:
+                  status = "failed"
+                  reason = "insufficient_funds"
+                  
+                  # 1. Update Payments Table (Recording the failure)
+                  ddb.put_item(
+                    TableName=payments_table_name,
+                    Item={
+                      "paymentId": {"S": payment_id},
+                      "orderId": {"S": order_id},
+                      "paymentConfirmed": {"S": status},
+                      "amount": {"N": str(amount)},
+                      "reason": {"S": reason}
+                    }
+                  )
+
+                  # 2. Publish PaymentConfirmation (to Orders Lambda for status update)
+                  payment_confirmation_event = {
+                    "orderId": order_id, 
+                    "paymentConfirmed": False,
+                    "reason": reason,
+                    "orderItems": order_items
+                  }
+                  
+                  eb.put_events(
+                    Entries=[{
+                      "Source": "payment.service",
+                      "DetailType": "PaymentConfirmation",
+                      "Detail": json.dumps(payment_confirmation_event),
+                      "EventBusName": os.environ['EVENT_BUS_NAME']
+                    }]
+                  )
+                  logger.info(f"PaymentConfirmation: False event published for order {order_id}.")
+                
+              except ClientError as e:
+                logger.error(f"DynamoDB Error during payment processing: {e}", exc_info=True)
+                raise e
+
+              except Exception as e:
+                logger.error(f"General error processing payment record: {e}", exc_info=True)
+                raise e
+            
+            return {"statusCode": 200}
+
+  # Connect Payment SQS -> Payment Lambda
+  PaymentEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PaymentQueue.Arn
+      FunctionName: !Ref PaymentLambda
+      BatchSize: 1
+
+  # EventBridge Rule: StockConfirmation=True -> Payment Queue
+  StockConfirmationTrueRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: StockConfirmationTrueRule
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: An event bridge rule to route stock status (True) message to Payment lambda.
+      EventPattern:
+        source:
+          - "inventory.service"
+        detail-type:
+          - "StockConfirmation"
+        detail:
+          stockConfirmed:
+            - true
+      Targets:
+        - Id: PaymentQueueTargetForInventory
+          Arn: !GetAtt PaymentQueue.Arn
+
+  StockConfirmationTrueRulePermission:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref PaymentQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt StockConfirmationTrueRule.Arn
+
+  # SNS topic to Payment Failures
+  PaymentFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PaymentFailureTopic
+
+  # EventBridge to SNS for failure
+  PaymentFailureToSNSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentFailureToSNS
+      Description: An event bridge rule to route payment status message to SNS
+      EventBusName: !ImportValue EcomEventBusArn
+      EventPattern:
+        source:
+          - "payment.service"
+        detail-type:
+          - "PaymentConfirmation"
+        detail:
+          payment_status:
+            - failed
+      Targets:
+        - Arn: !Ref PaymentFailureTopic
+          Id: SnsPaymentFailureTarget
+
+Outputs:
+  PaymentTableName:
+    Value: !Ref PaymentTable
+  PaymentQueueName:
+    Value: !GetAtt PaymentQueue.QueueName
+  PaymentLambdaName:
+    Value: !Ref PaymentLambda
+  PaymentFailureTopicArn:
+    Value: !Ref PaymentFailureTopic

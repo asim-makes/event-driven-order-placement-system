@@ -28,13 +28,20 @@ Resources:
       QueueName: InventoryQueue
       MessageRetentionPeriod: 1209600
 
+  # SQS queue for failure
+  InventoryCompensationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InventoryCompensationQueue
+      MessageRetentionPeriod: 1209600
+
   # Inventory Lambda Role
   InventoryLambdaRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: inventory-lambda-role
 
-      Description: Allow inventory lambda to assume a role to interact with inventory table.
+      Description: Allow inventory lambda to assume a role to interact with inventory table, cloudwatch, sqs, and eventbridge.
 
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -50,7 +57,7 @@ Resources:
 
       Policies:
         # DynamoDb Permission
-        - PolicyName: InventoryDynamoAccess
+        - PolicyName: InventoryEBDynamoAccess
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -88,10 +95,12 @@ Resources:
         Variables:
           TABLE_NAME: !Ref InventoryTable
           EVENT_BUS_NAME: EcomEventBus
+          INVENTORY_QUEUE_ARN: !GetAtt InventoryQueue.Arn
+          COMPENSATION_QUEUE_ARN: !GetAtt InventoryCompensationQueue.Arn
       Code:
         ZipFile: |
-          import os, json, boto3, uuid
-          import logging
+          import os, json, boto3, logging
+          from botocore.exceptions import ClientError
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
@@ -99,44 +108,113 @@ Resources:
           ddb = boto3.client('dynamodb')
           eb = boto3.client('events')
 
-          ORDER_STATUS = 'pending'
-
           def handler(event, context):
-            for record in event['Records']:
-              eventbridge_event = json.loads(record["body"])
-              detail = eventbridge_event["detail"]
+            for record in event['Records']:              
+              try:
+                eventbridge_event = json.loads(record["body"])
+                detail = eventbridge_event.get("detail", {})
+                detail_type = eventbridge_event.get("detail-type")
 
-              order_id = detail["orderId"]
-              order_items = detail["items"]
+                if detail_type == "PaymentConfirmation":
+                  operation = "COMPENSATION"
+                elif detail_type == "OrderPlaced":
+                  operation = "DECREMENT" 
+                else:
+                  logger.error(f"Unknown event source ARN: {event_source_arn}")
+                  continue
 
-              inventory_table_name = os.environ['TABLE_NAME']
+                order_id = detail.get("orderId")
+                order_items = detail.get("orderItems", [])
 
-              for item_id in order_items:
-                resp = ddb.get_item(
-                  TableName=inventory_table_name, 
-                  Key={"itemId": {"S": item_id}}
-                )
+                if not order_id:
+                  logger.error(f"Missing orderId in event detail: {detail}. Skipping record.")
+                  continue
 
-                if "Item" not in resp:
-                  stock_confirmed = False
-                  break
-              
-              status = {"orderId": order_id, "stockConfirmed": stock_confirmed}
+                inventory_table_name = os.environ['TABLE_NAME']
+                stock_confirmed = True
+                out_of_stock_item = None
 
-              if not stock_confirmed:
-                status["reason"] = "out_of_stock"
+                if operation == "COMPENSATION":
+                  logger.info(f"Received PaymentConfirmation: False for order {order_id}. Initiating stock compensation.")
+                  
+                  for item_id in order_items:
+                    try:
+                      ddb.update_item(
+                        TableName=inventory_table_name,
+                        Key={"itemId": {"S": item_id}},
+                        UpdateExpression="SET #qty = #qty + :val",
+                        ExpressionAttributeNames={"#qty": "quantity"},
+                        ExpressionAttributeValues={":val": {"N": "1"}},
+                        ReturnValues="UPDATED_NEW"
+                      )
+                      logger.info(f"Stock successfully compensated (increased) for item {item_id}.")
+                  
+                    except ClientError as e:
+                      logger.error(f"Failed to compensate stock for item {item_id}: {e}", exc_info=True)
+                      raise e
 
-              eb.put_events(
-              Entries=[{
-                "Source": "inventory.service",
-                "DetailType": "StockConfirmation",
-                "Detail": json.dumps(status),
-                "EventBusName": os.environ['EVENT_BUS_NAME']
-              }]
+                  continue
 
-              logger.info(f"StockConfirmation event published to bus: {os.environ['EVENT_BUS_NAME']}")
+                elif operation == "DECREMENT":
 
-            )
+                  order_amount = detail.get("amount")
+
+                  if not order_amount:
+                    logger.error(f"Missing items or amount in event detail: {detail}. Skipping record.")
+                    continue
+
+                  for item_id in order_items:
+                    try:
+                      ddb.update_item(
+                        TableName=inventory_table_name,
+                        Key={"itemId": {"S": item_id}},
+                        UpdateExpression="SET #qty = #qty - :val",
+                        ConditionExpression="#qty >= :val", # Condition: only update if stock is sufficient
+                        ExpressionAttributeNames={
+                          "#qty": "quantity" # Assuming 'quantity' is the stock field
+                        },
+                        ExpressionAttributeValues={
+                          ":val": {"N": "1"} # Assuming each order item is a single unit
+                        },
+                        ReturnValues="UPDATED_NEW"
+                      )
+                      logger.info(f"Stock successfully decremented for item {item_id} in order {order_id}.")
+                  
+                    except ClientError as e:
+                      if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                        stock_confirmed = False
+                        out_of_stock_item = item_id
+                        logger.warning(f"Stock check failed for item {item_id}. Quantity is zero or less.")
+                        break
+                      else:
+                        raise e
+                
+                  status = {
+                    "orderId": order_id,
+                    "stockConfirmed": stock_confirmed,
+                    "amount": order_amount,
+                    "orderItems": order_items
+                  }
+
+                  if not stock_confirmed:
+                    status["reason"] = f"out_of_stock: {out_of_stock_item}"
+
+                  eb.put_events(
+                    Entries=[{
+                      "Source": "inventory.service",
+                      "DetailType": "StockConfirmation",
+                      "Detail": json.dumps(status),
+                      "EventBusName": os.environ['EVENT_BUS_NAME']
+                    }]
+                  )
+
+                logger.info(f"StockConfirmation event published for order {order_id}. Status: {stock_confirmed}")
+
+              except json.JSONDecodeError:
+                logger.error(f"Error decoding SQS record body: {record['body']}")
+              except Exception as e:
+                logger.error(f"Error processing inventory check for record: {e}", exc_info=True)
+                raise e
 
             return {"statusCode": 200}
       Timeout: 10
@@ -181,6 +259,50 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !GetAtt OrderPlacedRule.Arn
 
+  # EventBridge Rule: Route to Copmensation Queue
+  PaymentFailureRollBackRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: PaymentFailureRollBackRule
+      EventBusName: !ImportValue EcomEventBusArn
+      Description: Routes payment failure events to inventory lambda to restore stock.
+      EventPattern:
+        source:
+          - payment.service
+        detail-type:
+          - "PaymentConfirmation"
+        detail:
+          paymentConfirmed:
+            - false
+      Targets:
+        - Id: InventoryCompensationSQSTarget
+          Arn: !GetAtt InventoryCompensationQueue.Arn
+  
+  # Permissions to grant event bridge to publish message to Inventory Compensation queue
+  InventoryCompensationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InventoryCompensationQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt InventoryCompensationQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt PaymentFailureRollBackRule.Arn
+
+  # Lambda trigger so that it polls the queue
+  InventoryCompensationQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt InventoryCompensationQueue.Arn
+      FunctionName: !Ref InventoryLambda
+      BatchSize: 1
+
   # SNS Topic
   NotificationsTopic:
     Type: AWS::SNS::Topic
@@ -188,10 +310,10 @@ Resources:
       TopicName: NotificationsTopic
 
   # EventBridge Rule: forward all StockConfirmation to SNS
-  StockConfirmationToSNSTopic:
+  StockConfirmationToSNSRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: StockConfirmationToSNS
+      Name: StockConfirmationToSNSRule
       EventBusName: !ImportValue EcomEventBusArn
       Description: An event bridge rule to route stock status message to SNS.
       EventPattern:
