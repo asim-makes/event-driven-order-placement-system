@@ -21,12 +21,18 @@ Resources:
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue MyKmsKeyArn
+
   # SQS queue for inventory
   InventoryQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: InventoryQueue
       MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # SQS queue for failure
   InventoryCompensationQueue:
@@ -34,6 +40,7 @@ Resources:
     Properties:
       QueueName: InventoryCompensationQueue
       MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # Inventory Lambda Role
   InventoryLambdaRole:
@@ -72,6 +79,12 @@ Resources:
                 Action:
                   - events:PutEvents
                 Resource: !ImportValue EcomEventBusArn
+              # KMS Key Permission
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !ImportValue MyKmsKeyArn
 
   # CloudWatch log groups for lambda
   InventoryServiceLogGroup:
@@ -252,7 +265,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: "*"
+            Principal:
+              Service: events.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt InventoryQueue.Arn
             Condition:
@@ -288,7 +302,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: "*"
+            Principal:
+              Service: events.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt InventoryCompensationQueue.Arn
             Condition:
@@ -304,10 +319,11 @@ Resources:
       BatchSize: 1
 
   # SNS Topic
-  NotificationsTopic:
+  StockNotificationsTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: NotificationsTopic
+      TopicName: StockNotificationsTopic
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # EventBridge Rule: forward all StockConfirmation to SNS
   StockConfirmationToSNSRule:
@@ -323,7 +339,35 @@ Resources:
           - "StockConfirmation"
       Targets:
         - Id: SnsTarget
-          Arn: !Ref NotificationsTopic
+          Arn: !Ref StockNotificationsTopic
+          InputTransformer:
+            InputPathsMap:
+              order: "$.detail.orderId"
+              status_reason: "$.detail.reason"
+            InputTemplate: |
+              {
+                "Subject": "Important: Item Out of Stock for Order <order>",
+                "Message": "Dear Customer,\n\nWe regret to inform you that we cannot fulfill your Order ID: <order> as an item is currently out of stock.\n\nReason: <status_reason>\n\nWe apologize for the inconvenience. A separate notification will follow regarding the next steps for your order.\n\nThank you,\nE-commerce Team"
+              }
+
+  # Permission for EventBridge to publish to SNS
+  StockNotificiationPubPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: StockNotificationSNSPolicy
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: sns:Publish
+            Resource: !Ref StockNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt StockConfirmationToSNSRule.Arn
+      Topics:
+        - !Ref StockNotificationsTopic
 
 Outputs:
   InventoryTableName:
@@ -332,5 +376,5 @@ Outputs:
     Value: !GetAtt InventoryQueue.QueueName
   InventoryLambdaName:
     Value: !Ref InventoryLambda
-  NotificationsTopicArn:
-    Value: !Ref NotificationsTopic
+  SNSNotificationsTopicArn:
+    Value: !Ref StockNotificationsTopic

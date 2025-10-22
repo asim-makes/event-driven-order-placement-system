@@ -21,6 +21,11 @@ Resources:
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue MyKmsKeyArn
+
   # IAM role for Lambda
   OrderLambdaRole:
     Type: AWS::IAM::Role
@@ -56,6 +61,12 @@ Resources:
                 Action:
                   - events:PutEvents
                 Resource: !ImportValue EcomEventBusArn
+              # KMS Key Permission
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !ImportValue MyKmsKeyArn
           PolicyName: OrderTableAccess
 
   # CloudWatch log groups for lambda

@@ -11,11 +11,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: ShippingNotifications
-
-  OpsAlertTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: OpsAlertNotifications
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # DynamoDB Table
   ShippingTable:
@@ -37,16 +33,23 @@ Resources:
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue MyKmsKeyArn
+
   # SQS Queue: Main Queue and DLQ
   ShippingDLQ:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: ShippingDLQ
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   ShippingQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: ShippingQueue
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt ShippingDLQ.Arn
         maxReceiveCount: 3
@@ -94,7 +97,13 @@ Resources:
                 - sns:Publish
               Resource:
                 - !Ref ShippingNotificationTopic
-                - !Ref OpsAlertTopic
+                - !ImportValue EcomOpsAlertTopicArn
+            # KMS Key Permission
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !ImportValue MyKmsKeyArn
 
   # CloudWatch log groups for lambda
   ShipmentServiceLogGroup:
@@ -117,6 +126,7 @@ Resources:
         Variables:
           SHIPPING_TABLE_NAME: !Ref ShippingTable
           SHIPPING_TOPIC_ARN: !Ref ShippingNotificationTopic
+          OPS_TOPIC_ARN: !ImportValue EcomOpsAlertTopicArn
           EVENT_BUS_NAME: EcomEventBus
       Code:
         ZipFile: |
@@ -130,7 +140,8 @@ Resources:
           sns = boto3.client('sns')
 
           SHIPPING_TABLE = os.environ['SHIPPING_TABLE_NAME']
-          TOPIC_ARN = os.environ['SHIPPING_TOPIC_ARN']
+          SHIPPING_TOPIC_ARN = os.environ['SHIPPING_TOPIC_ARN']
+          OPS_TOPIC_ARN = os.environ['OPS_TOPIC_ARN']
           EVENT_BUS_NAME = os.environ['EVENT_BUS_NAME']
 
           shipping_table = ddb.Table(SHIPPING_TABLE)
@@ -139,6 +150,39 @@ Resources:
           def external_shipping_api_sim(order_id):
             time.sleep(0.5)
             if random.random() < 0.20:
+              customer_notification_content = {
+                "customer_apology": "Greetings from XYZ Shopping. We sincerely apologize, but there has been an unexpected issue processing your recent order. This is a fault from our end, and we are working to resolve it immediately.",
+                "customer_reassurance": "The customer has been informed (or will be) that the Ops team has been engaged to manually resolve the issue. No further customer action is required."
+              }
+
+              ops_notification_content = {
+                "issue_summary": "StockConfirmation event failed to process.",
+                "affected_order_id": order_id,
+                "failure_source": "EventBridge Rule: StockConfirmationToSNSRule",
+                "required_action": "Manually investigate the last failed EventBridge event and re-insert the message into the SQS queue or manually reconcile stock/shipment status.",
+              }
+
+              customer_message_payload = {
+                "default": json.dumps(customer_notification_content) 
+              }
+
+              ops_message_payload = {
+                "default": json.dumps(ops_notification_content) 
+              }
+
+              # Send message to customer
+              sns_client.publish(
+                TopicArn=SHIPPING_TOPIC_ARN,
+                Message=json.dumps(customer_message_payload),
+                MessageStructure='json'
+              )
+
+              # Send message to Ops team
+              sns_client.publish(
+                TopicArn=OPS_TOPIC_ARN,
+                Message=json.dumps(ops_message_payload),
+                MessageStructure='json'
+              )
               raise Exception("External shipping API timed out")
             return {
               "carrier": "FastShip",
@@ -179,7 +223,7 @@ Resources:
                 logger.info(f"Shipping for order {order_id} created: {shipping_item}")
 
                 sns.publish(
-                  TopicArn=TOPIC_ARN,
+                  TopicArn=SHIPPING_TOPIC_ARN,
                   Message=json.dumps({"default": json.dumps({"message": "Your shipment is on the way", "orderId": order_id, "shippingId": shipping_id})}),
                   MessageStructure='json'
                 )
@@ -189,7 +233,7 @@ Resources:
                 shipping_confirmation_event = {
                   "orderId": order_id,
                   "shippingId": shipping_id,
-                  "shippingStatus": "SHIPPED", # Use a clearer, distinct status for the Order table
+                  "shippingStatus": "SHIPPED",
                   "trackingNumber": api_resp["trackingNumber"]
                 }
                 
@@ -240,7 +284,8 @@ Resources:
         Statement:
           - Sid: AllowEventBridgeSendMessage
             Effect: Allow
-            Principal: "*"
+            Principal:
+              Service: events.amazonaws.com
             Action: sqs:sendMessage
             Resource: !GetAtt ShippingQueue.Arn
             Condition:
@@ -299,7 +344,13 @@ Resources:
                 - sns:Publish
               Resource:
                 - !Ref ShippingNotificationTopic
-                - !Ref OpsAlertTopic
+                - !ImportValue EcomOpsAlertTopicArn
+            # KMS Key Permission
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !ImportValue MyKmsKeyArn
 
   # CloudWatch log groups for lambda
   DLQServiceLogGroup:
@@ -363,9 +414,10 @@ Resources:
                 shipping_table.put_item(Item=shipping_item)
 
                 notification_content = {
-                  "message": "Your shipment has been reprocessed and is on delivery",
+                  "message": "Your shipment has been reprocessed by Ops team and is on delivery",
                   "orderId": order_id,
-                  "shippingId": shipping_id
+                  "shippingId": shipping_id,
+                  "tracking_number": tracking_number
                 }
 
                 sns.publish(
@@ -411,6 +463,7 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: ShippingDLQAlarm
+      AlarmDescription: A cloudwatch alarm to send email to ops team in case the message count in DLQ exceeds 0.
       Namespace: AWS/SQS
       MetricName: ApproximateNumberOfMessagesVisible
       Dimensions:
@@ -422,9 +475,9 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       AlarmActions:
-        - !Ref OpsAlertTopic
+        - !ImportValue EcomOpsAlertTopicArn
       OKActions:
-        - !Ref OpsAlertTopic
+        - !ImportValue EcomOpsAlertTopicArn
 
 Outputs:
   ShippingQueueUrl:
@@ -437,5 +490,3 @@ Outputs:
     Value: !Ref ShippingLambda
   ShippingNotificationTopicArn:
     Value: !Ref ShippingNotificationTopic
-  OpsAlertTopicArn:
-    Value: !Ref OpsAlertTopic

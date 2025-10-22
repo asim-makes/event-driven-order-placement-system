@@ -21,12 +21,18 @@ Resources:
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !ImportValue MyKmsKeyArn
+
   # SQS queue for payment
   PaymentQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: PaymentQueue
       MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # Payment Lambda role
   PaymentLambdaRole:
@@ -47,6 +53,7 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
         - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
 
       Policies:
       - PolicyName: PaymentEBDynamoAccess
@@ -65,6 +72,12 @@ Resources:
               Action:
                 - events:PutEvents
               Resource: !ImportValue EcomEventBusArn
+            # KMS Key Permission
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: !ImportValue MyKmsKeyArn
 
   # CloudWatch log groups for lambda
   PaymentServiceLogGroup:
@@ -82,6 +95,14 @@ Resources:
       FunctionName: PaymentLambda
       Runtime: python3.11
       Description: Payment lambda function that processes confirmed order routes from event bridge.
+      TracingConfig:
+        Mode: Active
+      # Layers:
+      #   - Fn::Sub:
+      #     - arn:${Partition}:lambda:${Region}:580247275435:layer:aws-xray-sdk:2
+      #     - Partition: !Ref "AWS::Partition"
+      #       Region: !Ref "AWS::Region"
+      #       AccountID: !Ref "AWS::AccountId"
       Handler: index.handler
       Role: !GetAtt PaymentLambdaRole.Arn
       Environment:
@@ -94,6 +115,9 @@ Resources:
           import os, json, boto3, uuid, logging, random
           from decimal import Decimal
           from botocore.exceptions import ClientError
+          # from aws_xray_sdk.core import patch_all
+
+          # patch_all()
 
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
@@ -249,7 +273,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: "Allow"
-            Principal: "*"
+            Principal:
+              Service: events.amazonaws.com
             Action: sqs:SendMessage
             Resource: !GetAtt PaymentQueue.Arn
             Condition:
@@ -261,6 +286,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: PaymentFailureTopic
+      KmsMasterKeyId: !ImportValue MyKmsKeyArn
 
   # EventBridge to SNS for failure
   PaymentFailureToSNSRule:
@@ -280,6 +306,55 @@ Resources:
       Targets:
         - Arn: !Ref PaymentFailureTopic
           Id: SnsPaymentFailureTarget
+          InputTransformer:
+            InputPathsMap:
+              order: "$.detail.orderId"
+              status_reason: "$.detail.reason"
+            InputTemplate: |
+              {
+                "Subject": "Important: Your Order <order> Payment Failed",
+                "Message": "Dear Customer,\n\nWe encountered an issue processing the payment for your Order ID: <order>.\n\nReason for Failure: <status_reason>\n\nPlease update your payment method and try again.\n\nThank you,\nE-commerce Team"
+              }
+
+  # Permission for EventBridge to publish to SNS
+  PaymentFailurePubPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: PaymentFailureSNSPolicy
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "events.amazonaws.com"
+            Action: sns:Publish
+            Resource: !Ref PaymentFailureTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt PaymentFailureToSNSRule.Arn
+      Topics:
+        - !Ref PaymentFailureTopic
+
+  # CloudWatch Alarm for Payment lambda
+  PaymentLambdaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+        - !ImportValue EcomOpsAlertTopicArn
+      OKActions:
+        - !ImportValue EcomOpsAlertTopicArn
+      AlarmDescription: A cloudwatch alarm to send email to ops team in case of payment lambda failure.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 180
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: PaymentLambda
+          Value: !Ref PaymentLambda
 
 Outputs:
   PaymentTableName:

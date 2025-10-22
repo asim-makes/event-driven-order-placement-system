@@ -2,6 +2,57 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Base infra - EventBridge Bus + shared resources
 
 Resources:
+
+  # Custom encryption key
+  MyKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for services encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: "key-policy"
+        Statement:
+          # Allow root user to manage keys
+          - Sid: Enable IAM user permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: "kms:*"
+            Resource: "*"
+          # Allow all principals in this account to use the key: Important because this fixes cycling issue
+          - Sid: Allow all principals in account to use key
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+            Resource: '*'
+          # Allow service principals to use the key for encryption/decryption
+          - Sid: Allow SQS/SNS/DynamoDB/EventBridge/CloudWatch to use the key
+            Effect: Allow
+            Principal:
+              Service:
+                - sqs.amazonaws.com
+                - sns.amazonaws.com
+                - dynamodb.amazonaws.com
+                - events.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      EnableKeyRotation: true
+
   # E-commerce Event Bus
   EcomEventBus:
     Type: AWS::Events::EventBus
@@ -9,8 +60,37 @@ Resources:
       Name: EcomEventBus
       Description: An event bus for my e-commerce application that routes and receives events from different services.
 
+  # Ops Alert topic
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: OpsAlertNotifications
+      KmsMasterKeyId: !Ref MyKMSKey
+
+  # Subscribe to the topic
+  OpsTeamEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !GetAtt OpsAlertTopic.TopicArn
+      Protocol: email
+      Endpoint: "asim.baralapl@gmail.com"
+
 Outputs:
+
+  KMSKeyArn:
+    Description: ARN of my kms key
+    Value: !GetAtt MyKMSKey.Arn
+    Export:
+      Name: MyKmsKeyArn
+
   EventBusArn:
+    Description: ARN of the shared event bus
     Value: !GetAtt EcomEventBus.Arn
     Export:
       Name: EcomEventBusArn
+
+  OpsAlertTopicArn:
+    Description: ARN of the Central Operations Alert Topic
+    Value: !Ref OpsAlertTopic
+    Export:
+      Name: EcomOpsAlertTopicArn
