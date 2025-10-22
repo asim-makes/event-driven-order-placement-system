@@ -301,8 +301,8 @@ Resources:
         detail-type:
           - "PaymentConfirmation"
         detail:
-          payment_status:
-            - failed
+          paymentConfirmed:
+            - false
       Targets:
         - Arn: !Ref PaymentFailureTopic
           Id: SnsPaymentFailureTarget
@@ -339,6 +339,7 @@ Resources:
   PaymentLambdaAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
+      AlarmName: PaymentLambdaAlarm
       ActionsEnabled: true
       AlarmActions:
         - !ImportValue EcomOpsAlertTopicArn
@@ -353,7 +354,7 @@ Resources:
       Threshold: 5
       ComparisonOperator: GreaterThanOrEqualToThreshold
       Dimensions:
-        - Name: PaymentLambda
+        - Name: FunctionName
           Value: !Ref PaymentLambda
 
 Outputs:

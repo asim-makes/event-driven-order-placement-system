@@ -171,14 +171,14 @@ Resources:
               }
 
               # Send message to customer
-              sns_client.publish(
+              sns.publish(
                 TopicArn=SHIPPING_TOPIC_ARN,
                 Message=json.dumps(customer_message_payload),
                 MessageStructure='json'
               )
 
               # Send message to Ops team
-              sns_client.publish(
+              sns.publish(
                 TopicArn=OPS_TOPIC_ARN,
                 Message=json.dumps(ops_message_payload),
                 MessageStructure='json'
@@ -465,7 +465,7 @@ Resources:
       AlarmName: ShippingDLQAlarm
       AlarmDescription: A cloudwatch alarm to send email to ops team in case the message count in DLQ exceeds 0.
       Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
+      MetricName: NumberOfMessagesReceived
       Dimensions:
         - Name: QueueName
           Value: !GetAtt ShippingDLQ.QueueName

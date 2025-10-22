@@ -1,0 +1,74 @@
+# AWS CLI Commands for Resource Information
+
+## 1) All about Lambda
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Check if Lambda is working** (Invoke Function) | `aws lambda invoke --function-name <function_name> --cli-binary-format raw-in-base64-out --payload '{}' /dev/stdout` | Invokes the function with an empty payload and sends the response to standard output. |
+| **Get summary of all functions** | `aws lambda list-functions --query "Functions[*].{Name:FunctionName, Runtime:Runtime,Memory:MemorySize,Handler:Handler}" --output table` | Lists function name, runtime, memory size, and handler in a table format. |
+| **View pull-based triggers** | `aws lambda list-event-source-mappings --function-name <function_name> --query "EventSourceMappings[*].{Source:EventSourceArn, BatchSize:BatchSize, Enabled:State,UUID:UUID}" --output table` | Shows triggers like SQS, DynamoDB Streams. **Note:** Does **not** show push-based triggers (SNS, API Gateway, EventBridge). |
+
+***
+
+## 2) All about DynamoDB Table
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Describe everything about a table** | `aws dynamodb describe-table --table-name InventoryTable --region us-east-1` | Provides full details about the table structure and status. |
+| **Find the keys and attributes** | `aws dynamodb describe-table --table-name InventoryTable --region us-east-1 --query "Table.{KeySchmea: KeySchmea, Attributes: AttributeDefinitions}"` | Focuses on the table's key schema and attribute definitions. (Note: The query path should likely be `KeySchema` not `KeySchmea`.) |
+| **Get specific items (Scan)** | `aws dynamodb scan --table-name InventoryTable --region us-east-1 --projection-expression "itemId, productName, quantity" --query "Items[*].{ID: itemId.S, Name: productName.S, Stock: quantity.N}" --output table` | Scans the table, projects specific attributes, and formats the output. |
+| **Scan the number of items (Filtered)** | `aws dynamodb scan --table-name InventoryTable --query "Items[?itemId.S == 'ITEM_ID-01'].quantity.N"` | Retrieves the `quantity` attribute value for a specific `itemId`. |
+| **Update table items** | `aws dynamodb update-item --table-name InventoryTable --key '{"itemId": {"S": "ITEM_ID-01"}}' --update-expression "SET quantity = :val" --expression-attribute-values '{":val": {"N": "15"}}' --region us-east-1` | Updates the `quantity` for the item with `itemId: "ITEM_ID-01"`. (Corrected Key JSON syntax: removed trailing colon from `ITEM_ID-01`). |
+
+***
+
+## 3) All about EventBridge
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **List all rules with summary of targets** | `aws events list-rules --event-bus-name <event_bus_name> --query "Rules[*].{Name:Name, State:State, Description:Description, Targets:CountTargets}" --output table` | Lists rules and their status/description, including the count of targets. |
+| **List details of specific targets of a rule** | `aws events list-targets-by-rule --event-bus-name <event_bus_name> --rule "MyScheduledJobRule" --query "Targets[*].{TargetId:Id, TargetARN:Arn}" --output table` | Provides the ID and ARN for all targets attached to the specified rule. |
+
+***
+
+## 4) All about SQS
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Get queue names** | `aws sqs list-queues --query 'QueueUrls[]' --output text | xargs -n 1 basename` | Lists the names of all queues by extracting the basename from their URLs. |
+| **Get a queue and check attributes (including DLQ)** | ```bash
+QUEUE_URL=$(aws sqs get-queue-url --queue-name <queue_name> --query "QueueUrl" --output text)
+aws sqs get-queue-attributes --queue-url "$QUEUE_URL" --attribute-names QueueArn MessageRetentionPeriod RedrivePolicy --query "Attributes" --output json
+``` | First retrieves the queue URL, then gets specific attributes like ARN, message retention, and the `RedrivePolicy` (for DLQ configuration). |
+
+***
+
+## 5) Retrieve the API Gateway URL
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Get API Gateway URL from CloudFormation Stack Output** | `aws cloudformation describe-stacks --stack-name order-stack --query "Stacks[0].Outputs[?OutputKey=='OrdersApiEndpoint'].OutputValue" --output text` | Extracts the value of the `OrdersApiEndpoint` output from the specified CloudFormation stack. |
+
+***
+
+## 6) Curl the API Gateway
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Invoke API Gateway via curl (POST)** | ```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": ["ITEM_ID-15", "ITEM_ID-02"],
+    "amount": 1250.99
+  }' \
+  $API
+``` | Uses `curl` to send a POST request with a JSON payload to the API endpoint stored in the `$API` shell variable. |
+
+***
+
+## 7) Get Log Groups
+
+| Action | CLI Command | Notes |
+| :--- | :--- | :--- |
+| **Describe Log Groups by prefix** | `aws logs describe-log-groups --log-group-name-prefix '/aws/lambda/OrderLambda' --region us-east-2` | Finds log groups whose names start with the specified prefix (common for Lambda function logs). |

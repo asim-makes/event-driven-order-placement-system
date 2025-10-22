@@ -1,0 +1,26 @@
+--- AWS CloudFormation Destruction Log ---
+2025-10-22 22:41:33 - Starting sequential CloudFormation stack destruction in region: us-east-1
+2025-10-22 22:41:33 - Log file path: logs/destruction_20251022_224132.log
+2025-10-22 22:41:33 - ------------------------------------------------------------
+2025-10-22 22:41:33 - Attempting to delete stack: **OrdersStack**
+2025-10-22 22:41:37 - ⏳ Waiting for stack **OrdersStack** to complete deletion...
+2025-10-22 22:42:43 - Stack **OrdersStack** deleted successfully.
+2025-10-22 22:42:43 - 
+2025-10-22 22:42:43 - Attempting to delete stack: **InventoryStack**
+2025-10-22 22:42:48 - ⏳ Waiting for stack **InventoryStack** to complete deletion...
+2025-10-22 22:42:50 - Stack **InventoryStack** deleted successfully.
+2025-10-22 22:42:50 - 
+2025-10-22 22:42:50 - Attempting to delete stack: **PaymentsStack**
+2025-10-22 22:42:54 - ⏳ Waiting for stack **PaymentsStack** to complete deletion...
+2025-10-22 22:42:57 - Stack **PaymentsStack** deleted successfully.
+2025-10-22 22:42:57 - 
+2025-10-22 22:42:57 - Attempting to delete stack: **ShippingStack**
+2025-10-22 22:43:01 - ⏳ Waiting for stack **ShippingStack** to complete deletion...
+2025-10-22 22:45:41 - Stack **ShippingStack** deleted successfully.
+2025-10-22 22:45:41 - 
+2025-10-22 22:45:41 - Attempting to delete stack: **BaseInfraStack**
+2025-10-22 22:45:47 - ⏳ Waiting for stack **BaseInfraStack** to complete deletion...
+2025-10-22 22:47:24 - Stack **BaseInfraStack** deleted successfully.
+2025-10-22 22:47:24 - 
+2025-10-22 22:47:24 - ------------------------------------------------------------
+2025-10-22 22:47:24 - All specified CloudFormation stacks have been destroyed successfully!

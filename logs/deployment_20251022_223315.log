@@ -1,0 +1,48 @@
+--- AWS CloudFormation Deployment Log ---
+2025-10-22 22:33:15 - Starting sequential CloudFormation deployment in region: us-east-1
+2025-10-22 22:33:15 - Templates directory: templates
+2025-10-22 22:33:15 - Log file path: logs/deployment_20251022_223315.log
+2025-10-22 22:33:15 - ------------------------------------------------------------
+2025-10-22 22:33:15 - Deploying stack: **BaseInfraStack** using template: **templates/base-infra.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - BaseInfraStack
+2025-10-22 22:33:57 - Stack **BaseInfraStack** deployed successfully.
+2025-10-22 22:33:57 - 
+2025-10-22 22:33:57 - Deploying stack: **OrdersStack** using template: **templates/orders.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - OrdersStack
+2025-10-22 22:36:15 - Stack **OrdersStack** deployed successfully.
+2025-10-22 22:36:15 - 
+2025-10-22 22:36:15 - Deploying stack: **InventoryStack** using template: **templates/inventory.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+
+Failed to create/update the stack. Run the following command
+to fetch the list of events leading up to the failure
+aws cloudformation describe-stack-events --stack-name InventoryStack
+2025-10-22 22:37:28 - Stack **InventoryStack** deployed successfully.
+2025-10-22 22:37:28 - 
+2025-10-22 22:37:28 - Deploying stack: **PaymentsStack** using template: **templates/payments.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+
+Failed to create/update the stack. Run the following command
+to fetch the list of events leading up to the failure
+aws cloudformation describe-stack-events --stack-name PaymentsStack
+2025-10-22 22:38:41 - Stack **PaymentsStack** deployed successfully.
+2025-10-22 22:38:41 - 
+2025-10-22 22:38:41 - Deploying stack: **ShippingStack** using template: **templates/shipping.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - ShippingStack
+2025-10-22 22:40:57 - Stack **ShippingStack** deployed successfully.
+2025-10-22 22:40:57 - 
+2025-10-22 22:40:57 - ------------------------------------------------------------
+2025-10-22 22:40:57 - All 5 CloudFormation stacks have been deployed successfully!
