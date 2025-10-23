@@ -1,0 +1,42 @@
+--- AWS CloudFormation Deployment Log ---
+2025-10-23 05:59:19 - Starting sequential CloudFormation deployment in region: us-east-1
+2025-10-23 05:59:19 - Templates directory: templates
+2025-10-23 05:59:19 - Log file path: logs/deployment_20251023_055919.log
+2025-10-23 05:59:19 - ------------------------------------------------------------
+2025-10-23 05:59:19 - Deploying stack: **base-infra** using template: **templates/base-infra.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - base-infra
+2025-10-23 06:00:01 - Stack **base-infra** deployed successfully.
+2025-10-23 06:00:01 - 
+2025-10-23 06:00:01 - Deploying stack: **order-stack** using template: **templates/orders.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - order-stack
+2025-10-23 06:02:16 - Stack **order-stack** deployed successfully.
+2025-10-23 06:02:16 - 
+2025-10-23 06:02:16 - Deploying stack: **inventory-stack** using template: **templates/inventory.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - inventory-stack
+2025-10-23 06:04:32 - Stack **inventory-stack** deployed successfully.
+2025-10-23 06:04:32 - 
+2025-10-23 06:04:32 - Deploying stack: **payment-stack** using template: **templates/payments.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - payment-stack
+2025-10-23 06:06:47 - Stack **payment-stack** deployed successfully.
+2025-10-23 06:06:47 - 
+2025-10-23 06:06:47 - Deploying stack: **shipping-stack** using template: **templates/shipping.yaml**
+
+Waiting for changeset to be created..
+Waiting for stack create/update to complete
+Successfully created/updated stack - shipping-stack
+2025-10-23 06:09:03 - Stack **shipping-stack** deployed successfully.
+2025-10-23 06:09:03 - 
+2025-10-23 06:09:03 - ------------------------------------------------------------
+2025-10-23 06:09:03 - All 5 CloudFormation stacks have been deployed successfully!

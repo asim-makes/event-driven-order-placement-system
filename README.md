@@ -171,10 +171,12 @@ All resources are deployed using **pure CloudFormation YAML**, organized by stac
 
 To deploy:
 ```bash
-chmod+x deploy_stacks.sh
+chmod +x deploy_stacks.sh
 ./deploy_stacks.sh
+```
 
 To destroy:
 ```bash
-chmod+x destroy_stacks.sh
+chmod +x destroy_stacks.sh
 ./destroy_stacks.sh
+```

@@ -8,11 +8,11 @@ LOG_DIR="logs"
 LOG_FILE="$LOG_DIR/destruction_$(date +%Y%m%d_%H%M%S).log"
 
 STACKS_TO_DESTROY=(
-    "OrdersStack"
-    "InventoryStack"
-    "PaymentsStack"
-    "ShippingStack"
-    "BaseInfraStack"
+    "order-stack"
+    "inventory-stackk"
+    "payment-stack"
+    "shipping-stack"
+    "base-infra"
 )
 
 mkdir -p "$LOG_DIR"

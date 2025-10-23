@@ -10,11 +10,11 @@ LOG_FILE="$LOG_DIR/deployment_$(date +%Y%m%d_%H%M%S).log"
 TEMPLATES_DIR="templates"
 
 STACKS=(
-    "base-infra.yaml:BaseInfraStack"
-    "orders.yaml:OrdersStack"
-    "inventory.yaml:InventoryStack"
-    "payments.yaml:PaymentsStack"
-    "shipping.yaml:ShippingStack"
+    "base-infra.yaml:base-infra"
+    "orders.yaml:order-stack"
+    "inventory.yaml:inventory-stack"
+    "payments.yaml:payment-stack"
+    "shipping.yaml:shipping-stack"
 )
 
 mkdir -p "$LOG_DIR"
