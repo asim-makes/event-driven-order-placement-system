@@ -9,7 +9,7 @@ LOG_FILE="$LOG_DIR/destruction_$(date +%Y%m%d_%H%M%S).log"
 
 STACKS_TO_DESTROY=(
     "order-stack"
-    "inventory-stackk"
+    "inventory-stack"
     "payment-stack"
     "shipping-stack"
     "base-infra"
